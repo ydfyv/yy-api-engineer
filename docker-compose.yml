@@ -1,0 +1,161 @@
+# docker-compose.yml — Stable for 2C2G server (Nacos + Embedded Derby)
+version: 3
+
+services:
+  # ========== MySQL 8.0 ==========
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: yjc118181
+      MYSQL_DATABASE: yy_api
+      TZ: Asia/Shanghai
+    command: >
+      mysqld
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --innodb-buffer-pool-size=32M
+      --key-buffer-size=8M
+      --max-connections=30
+      --skip-name-resolve
+      --performance_schema=OFF
+      --innodb-log-file-size=16M
+    ports:
+      - "33601:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    networks:
+      - yy-net
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "--password=yjc118181" ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ========== Redis ==========
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --requirepass yyapi@redis --maxmemory 32mb --maxmemory-policy allkeys-lru
+    ports:
+      - "63791:6379"
+    networks:
+      - yy-net
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "yyapi@redis", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ========== Nacos (Standalone + Embedded Derby) ==========
+  nacos:
+    image: nacos/nacos-server:v2.2.3
+    container_name: nacos
+    environment:
+      MODE: standalone
+      # 优化内存，防止 OOM（关键！）
+      JVM_XMS: 192m
+      JVM_XMX: 320m
+      JVM_MS: 64m
+      JVM_MMS: 192m
+      TZ: Asia/Shanghai
+      PREFER_HOST_MODE: hostname
+      MANAGEMENT_METRICS_EXPORT_PROMETHEUS_ENABLED: "false"
+    ports:
+      - "8848:8848"
+    volumes:
+      - nacos_logs:/home/nacos/logs
+      - nacos_data:/home/nacos/data
+    # ⚠️ Nacos 使用内嵌 Derby，不依赖 MySQL/Redis！
+    # 所以这里不要 depends_on mysql/redis
+    networks:
+      - yy-net
+    healthcheck:
+      # 使用 curl（Nacos 官方镜像自带）
+      test: [ "CMD", "curl", "-f", "http://localhost:8848/nacos/v1/console/server/state" ]
+      interval: 20s
+      timeout: 10s
+      retries: 25
+      start_period: 150s  # 首次启动可能慢，给足时间
+    restart: unless-stopped
+
+  # ========== API Gateway ==========
+  yy-api-gateway:
+    build:
+      context: yy-api-microservice
+      dockerfile: Dockerfile.gateway
+    container_name: yy-api-gateway
+    ports:
+      - "8012:8012"
+      - "20881:20881"
+    environment:
+      JAVA_OPTS: "-Xms96m -Xmx192m -XX:+UseG1GC -Djava.security.egd=file:/dev/./urandom"
+      NACOS_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      DUBBO_CONFIG_CENTER: nacos://nacos:8848
+      DUBBO_REGISTRY_ADDRESS: nacos://nacos:8848
+    depends_on:
+      nacos:
+        condition: service_healthy
+    networks:
+      - yy-net
+    restart: unless-stopped
+
+  # ========== Backend Service ==========
+  yy-api-backend:
+    build:
+      context: yy-api-microservice
+      dockerfile: Dockerfile.backend
+    container_name: yy-api-backend
+    ports:
+      - "8111:8111"
+      - "20882:20882"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      JAVA_OPTS: "-Xms96m -Xmx192m -XX:+UseG1GC -Djava.security.egd=file:/dev/./urandom"
+      NACOS_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      DUBBO_CONFIG_CENTER: nacos://nacos:8848
+      DUBBO_REGISTRY_ADDRESS: nacos://nacos:8848
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nacos:
+        condition: service_healthy
+    networks:
+      - yy-net
+    restart: unless-stopped
+
+
+ # ========== Frontend ==========
+  yy-api-frontend:
+    build:
+      context: yy-api-frontend
+      dockerfile: Dockerfile
+    container_name: yy-api-frontend
+    ports:
+      - "80:80" # 对外暴露 80 端口
+    networks:
+      - yy-net
+    depends_on:
+      yy-api-gateway:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  nacos_logs:
+  nacos_data:
+  
+
+networks:
+  yy-net:
+    driver: bridge
